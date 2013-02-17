@@ -2,11 +2,14 @@
 
 use ExtUtils::MakeMaker;
 
+rename('README.md','README') if -f 'README.md';
+
 WriteMakefile(
 	NAME		=> 'Fuse::TagLayer',
 	AUTHOR		=> 'Clipland (clipland@cpan.org)',
-	ABSTRACT	=> 'tag-filesystem overlay for hierarchical fs',
+	ABSTRACT	=> 'Tag-filesystem overlay for hierarchical fs',
 	VERSION_FROM	=> 'lib/Fuse/TagLayer.pm', # finds \$VERSION
+	LICENSE		=> 'gpl', # as close as it gets to GPL3+AL2
 	PREREQ_PM	=> {
 		"Fuse"		=> '0.14',
 		"File::ExtAttr"	=> '1.09',
@@ -26,5 +29,11 @@ WriteMakefile(
 		resources	=> {
 			repository => 'https://github.com/clipland/fuse-taglayer',
 		},
+	},
+	dist => {
+		POSTOP => 'perl -e "rename(\'README\',\'README.md\') if -f \'README\'"',
+	},
+	realclean => {
+		POSTOP => 'perl -e "rename(\'README\',\'README.md\') if -f \'README\'"',
 	},
 );

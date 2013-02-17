@@ -11,7 +11,7 @@ use File::Basename ();
 use Fcntl qw(SEEK_SET);
 use POSIX qw(S_ISDIR ENOENT EISDIR EINVAL ENOSYS);
 
-our $VERSION = '0.09';
+our $VERSION = '0.10';
 our $self;
 
 sub new {
@@ -436,7 +436,7 @@ with directories.
 
 =head1 SEE ALSO
 
-L<FUSE>, obviously.
+L<FUSE|Fuse>, obviously.
 
 =head1 AUTHOR
 
