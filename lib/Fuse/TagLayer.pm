@@ -4,15 +4,16 @@ package Fuse::TagLayer;
 use warnings;
 
 use Data::Dumper;
-use DBI;
 use File::ExtAttr ();
 use File::Find ();
 use File::Basename ();
 use Fcntl qw(SEEK_SET);
 use POSIX qw(S_ISDIR ENOENT EISDIR EINVAL ENOSYS);
+use Encode;
 
-our $VERSION = '0.10';
+our $VERSION = '0.12';
 our $self;
+our $numbers_regex = qr/^\d+$/;
 
 sub new {
 	my $class = shift;
@@ -24,12 +25,19 @@ sub new {
 	$self->{uid} ||= 0;
 	$self->{gid} ||= 0;
 
-	print "TagLayer: Building TagLayer tags database...\n" if $self->{debug};
-	init_db();	## init db (SQLite)
+	print "TagLayer: version:$VERSION, debug:$self->{debug}\n" if $self->{debug} > 1;
 
-	## prepare a mysql insert statement
-	$self->{mysql_file_insert} = database()->prepare("INSERT INTO `file_tags` (`file`,`basename`,`tags`) VALUES (?,?,?); ") or die database()->errstr;
-	$self->{mysql_tags_insert} = database()->prepare("INSERT INTO `tags` (`tag`,`count`) VALUES (?,?); ") or die database()->errstr;
+	if($self->{backend} eq 'PurePerl'){
+		require Fuse::TagLayer::PurePerl;
+		Fuse::TagLayer::PurePerl->import();
+	}else{
+		require Fuse::TagLayer::SQLite;
+		Fuse::TagLayer::SQLite->import();
+	}
+
+	print "TagLayer: Building TagLayer tags database, using '$self->{backend}' backend...\n" if $self->{debug};
+	## init db backend
+	db_init( debug => $self->{debug} );
 
 	## prepare a mountpoint regex
 	my $mntre = quotemeta($self->{mountpoint});
@@ -37,54 +45,25 @@ sub new {
 
 	## build SQL tables
 	# table:file_tags
-	database()->{AutoCommit} = 0;
 	File::Find::find({ wanted => \&wanted }, $self->{realdir});
-	database()->commit;
+	db_sync(); # we assume backends to be non-auto-committing
 
 	# table:tags
 	for (keys %{ $self->{global_tags} }){
-#		print "$_, ". $self->{global_tags}->{$_} ." \n" if $self->{debug};
-		$self->{mysql_tags_insert}->execute($_, $self->{global_tags}->{$_}) or die database()->errstr;
+		print "## TagLayer::new: $_, ". $self->{global_tags}->{$_} ." \n" if $self->{debug} > 2;
+		db_tags_add($_, $self->{global_tags}->{$_});
 
 		$self->{tags_cnt}++;
-		database()->commit if $self->{tags_cnt} && ($self->{tags_cnt} % 250) == 0;
+		db_sync() if $self->{tags_cnt} && ($self->{tags_cnt} % 250) == 0;
 	}
 	delete($self->{global_tags});
-	database()->commit;
-	database()->{AutoCommit} = 1;
+	db_sync();
 
 	$self->{db_epoch} = time();
 
 	print "TagLayer: processed ".($self->{files_cnt}||0)." files with ".($self->{tags_cnt}||0)." tags.\n" if $self->{debug};
 
 	return $self;
-}
-
-sub init_db {
-	my $sql = "create table if not exists `tags` (
-		`tag` varchar(255) null,
-		`count` integer DEFAULT '0'
-	);";
-	database()->do($sql) or die database()->errstr;
-	my $empty = database()->prepare("DELETE FROM `tags`; ") or die database()->errstr;	# no TRUNCATE TABLE in SQLite
-	$empty->execute();
-
-	$sql = "create table if not exists `file_tags` (
-		`file` varchar(255) null,
-		`basename` varchar(255) null,
-		`tags` varchar(255) null
-	);";
-	database()->do($sql) or die database()->errstr;
-	my $empty2 = database()->prepare("DELETE FROM `file_tags`; ") or die database()->errstr;	# no TRUNCATE TABLE in SQLite
-	$empty2->execute();
-}
-
-sub database {
-	unless($self->{dbh}){
-		$self->{dbh} = DBI->connect("dbi:SQLite::memory:", "", "");
-	#	$self->{dbh} = DBI->connect("dbi:SQLite:dbname=/tmp/taglayer.sqlite", "", "");	# for debug only, make sure you delete the file after each mount!!
-	}
-	return $self->{dbh};
 }
 
 sub mount {
@@ -100,7 +79,7 @@ sub mount {
 	Fuse::main(
 		mountpoint => $self->{mountpoint},
 		threaded   => $self->{threaded} ? 1 : 0,
-		debug	   => $self->{debug} > 1 ? 1 : 0,
+		debug	   => $self->{debug} > 2 ? 1 : 0,
 
 		readdir	=> "Fuse::TagLayer::virt_readdir",
 		getattr	=> "Fuse::TagLayer::virt_getattr",
@@ -146,13 +125,26 @@ sub wanted {
 			push(@tags, 'zsuffix-'.$suffix);
 		}
 
-		push(@tags, split(/[^\p{L}\p{N}]/,$filename));	# matches all (Unicode) characters that are neither letters nor numbers
+		my @newtags = split(/[^\p{L}\p{N}]/,$filename);	# matches all (Unicode) characters that are neither letters nor numbers
+		for(@newtags){
+			next unless defined $_;
+			next if length($_) < 2;
+			next if $self->{ignore_numbers_only} && $_ =~ $numbers_regex;
+			push(@tags, $_);
+		}
 	}
 
 	## xattr tags
 	if(!$self->{no_tags_from_xattr}){
 		if(my $xattrtags = File::ExtAttr::getfattr( $File::Find::dir.'/'.$_, 'tags') ){
-			push(@tags, split(/,\s*/,$xattrtags));
+			$xattrtags = decode_utf8($xattrtags);
+			my @newtags = split(/,\s*/,$xattrtags);
+			for(@newtags){
+				next unless defined $_;
+				next if length($_) < 2;
+				next if $self->{ignore_numbers_only} && $_ =~ $numbers_regex;
+				push(@tags, $_);
+			}
 		}
 	}
 
@@ -162,18 +154,19 @@ sub wanted {
 		my $tag_cleaned = lc($_);
 		$tag_cleaned =~ s/[^\p{L}\p{N}]//g;	# matches all (Unicode) characters that are neither letters nor numbers
 		next if length($tag_cleaned) < 2;
+		next if $self->{ignore_numbers_only} && $tag_cleaned =~ $numbers_regex;
 		$tags{$tag_cleaned}++;
 
 		$self->{global_tags}->{$tag_cleaned}++;
 	}
 
 	# insert "/path/to", "filename", "tags as csv string"
-	$self->{mysql_file_insert}->execute( $File::Find::dir, $_, join(", ", keys %tags) ) or die database()->errstr;
+	db_files_add( $File::Find::dir, $_, keys(%tags) );
 	$self->{files_cnt}++;
 #	print "File: $self->{files_cnt}: $File::Find::dir, $_, ".join(", ", keys %tags)."\n";
 
 	if($self->{files_cnt} && ($self->{files_cnt} % 250) == 0){
-		database()->commit;
+		db_sync();
 		print " $self->{files_cnt} files processed\n" if $self->{debug};
 	}
 }
@@ -181,30 +174,27 @@ sub wanted {
 ## note the singular "file", as it should return only one file
 sub file_by_tagpath {
 	my ($basename,$directory) = File::Basename::fileparse(shift);
-# print "Directory:$directory Basename:$basename\n";
+
 	# 1st: only by tags
-	my @tags = dirpath_to_tags($directory);
+	my @pathtags = dirpath_to_tags($directory);
+	print "file_by_tagpath: directory:$directory ; basename:$basename ; pathtags:@pathtags\n" if $self->{debug};
 
-	return undef if !@tags;
+	return undef if !@pathtags;
 
-	my @sql_files;
-	for(@tags){
-		push(@sql_files, "`tags` REGEXP '$_'");
-	}
-	my $sql_files = join(" AND ",@sql_files);
+	my ($files_for_tags, $subtags) = db_files_for_tags(@pathtags);
+## print "PREFAIL: tags: @tags (".@tags.") ;; SELECT `file`,`basename` FROM `file_tags` WHERE $sql_files;\n";
+#	my $pre = database()->selectall_arrayref("SELECT `file`,`basename` FROM `file_tags` WHERE $sql_files; ", {Columns=>[1,2]}); # push first two rows into arrayref
 
-# print "PREFAIL: tags: @tags (".@tags.") ;; SELECT `file`,`basename` FROM `file_tags` WHERE $sql_files;\n";
-	my $pre = database()->selectall_arrayref("SELECT `file`,`basename` FROM `file_tags` WHERE $sql_files; ", {Columns=>[1,2]}); # push first two rows into arrayref
-
-	return undef if !@$pre;
+	return undef if !@$files_for_tags;
 
 	# 2nd: by basename
 	my @files;
-	for(@$pre){
-		push(@files, ${$_}[0].'/'.${$_}[1]) if ${$_}[1] eq $basename;
+	for(@$files_for_tags){
+		my ($thisbasename,$thisdirectory) = File::Basename::fileparse($_);
+		push(@files, $_) if $thisbasename eq $basename;
 	}
 
-	print "++ WARNING ++ file_by_tagpath($basename,@_) found multiple files: @files\n" if @files > 1;
+	print "TagLayer: ++ WARNING ++ file_by_tagpath($basename,@_) found multiple files: @files\n" if @files > 1;
 
 	return @files ? shift(@files) : undef;
 }
@@ -214,41 +204,25 @@ sub virt_readdir {
 
 	my (@dirs,@files);
 	if($path eq '/'){
-		## full tags list SQL style
-		my $dirs = database()->selectcol_arrayref("SELECT `tag` FROM `tags`; "); # push first row into arrayref
-		@dirs = @$dirs;
+		## return all tags:
+		@dirs = @{ db_tags_all() };
 	}else{
-		my @regex_dirs;
-		my @sql_files;
+		## return a list of:
+		## 1. all files tagged with the tags found in the path
+		## 2. Sub-dirs (tags left) found in theses files but not yet applied
 		my @pathtags = dirpath_to_tags($path);
-		for(@pathtags){
-			push(@regex_dirs, '^'.$_.'$');
-			push(@sql_files, "`tags` REGEXP '$_'");
+
+		my ($files_for_tags, $subtags) = db_files_for_tags(@pathtags);
+
+		for(@$files_for_tags){
+			($basename,$directory) = File::Basename::fileparse($_);
+			push(@files, $basename);
 		}
-
-		my $regex_dirs = join('|',@regex_dirs);
-		$regex_dirs = qr/$regex_dirs/;
-		my $sql_files = join(" AND ",@sql_files);
-		print "## virt_readdir: $path: regex_dirs:$regex_dirs ; sql_files:$sql_files\n" if $self->{debug};
-
-		## gather files: SQL style: results-set
-		my %tags;
-		$entries = database()->prepare("SELECT `basename`,`tags` FROM `file_tags` WHERE $sql_files; "); # push first row into arrayref
-		$entries->execute();
-		while( my $entry = $entries->fetchrow_hashref ){
-			push(@files, $entry->{basename});
-
-			for( split(/,\s*/,$entry->{tags}) ){
-				my $tag_cleaned = lc($_);
-				$tag_cleaned =~ s/[^\p{L}\p{N}]//g;	# matches all (Unicode) characters that are neither letters nor numbers
-				next if $tag_cleaned =~ $regex_dirs;
-				$tags{$_}++;
-			}
-		}
-		@dirs = keys %tags;
+		@dirs = keys %$subtags;
 	}
 
-	print "## virt_readdir: $path: sub-tags left (as dirs):@dirs ; files:@files\n" if $self->{debug};
+	print "## virt_readdir: $path: sub-tags left (as dirs):@dirs ; files:".scalar(@files)."\n" if $self->{debug};
+	print "## virt_readdir: \n    ".join("\n    ",@files)."\n" if $self->{debug} > 1 && @files;
 	return (@dirs || @files) ? ((@dirs,@files), 0) : 0;
 }
 
@@ -325,7 +299,7 @@ sub real_release {
 sub virt_statfs { return 255, 1, 1, 1, 1, 2 }
 
 sub umount {
-	database()->disconnect();
+	db_disconnect();
 }
 
 
@@ -347,8 +321,8 @@ Fuse::TagLayer - A read-only tag-filesystem overlay for hierarchical filesystems
   );
   $ftl->mount();
 
-The bundled L<taglayer> mounting script uses this module here, I<Fuse::TagLayer>, as
-its backend. On mount, it scans a specified dir for tags and mounts them as
+The bundled L<taglayer> mounting script uses this module here, I<Fuse::TagLayer>,
+as its backend. On mount, it scans a specified dir for tags and mounts them as
 the TagLayer filesystem at the mountpoint, by default /path/to/specified-dir/+tags.
 
   taglayer <real directory> [<tag directory mountpoint>]
@@ -362,19 +336,20 @@ just another "layer" to access these files (thus the name).
 
 =head2 How it works
 
-Fuse::TagLayer, on mount, scans a specified dir-path and gathers all the tags found in
-the files' "user.tags" extended-attribute. These xattr-tags are supplemented
-by "tags" derrived from what could be called "directory fragments". That means, a
-path like "/Path/to/file" is interpreted as being the tags "Path" and "to" (dropping
-the filename as source for tags for now). All these tags then are inserted into a
-database (SQLite) and the db is used to expose a tag-based file system at the mountpoint.
+Fuse::TagLayer, on mount, scans a specified dir-path and gathers all the tags found
+in the files' "user.tags" extended-attribute. These xattr-tags are supplemented
+by "tags" derrived from what could be called "directory fragments". That means,
+a path like "/Path/to/file" is interpreted as being the tags "Path" and "to" (dropping
+the filename as source for tags for now). All these tags then are inserted into
+a database backend (SQLite or a pure Perl one) and the db is used to expose a tag-based
+file system at the mountpoint.
 
 =head1 METHODS
 
-Right now, the module offers some OO-ish methods, and some plain functions. The mounting
-script uses the below OO methods new(), mount() and umount(). But note the quirk that
-$self is stored in a global I<our> variable, to mediate between the OO API and the 
-Fuse-style functions.
+Right now, the module offers some OO-ish methods, and some plain functions. The
+mounting script uses the below OO methods new(), mount() and umount(). But note
+the quirk that $self is stored in a global I<our> variable, to mediate between the
+OO API and the Fuse-style functions.
 
 =head2 new()
 
@@ -385,7 +360,7 @@ Fuse-style functions.
 =head1 FUNCTIONS
 
 A growing list of functions that match the FUSE bindings, some prefixed by "virt_"
-and some by "real_". The latter faciliating the loopback/ pass-trough to the real
+and some by "real_". The latter faciliating the loopback/ pass-through to the real
 filesystem:
 
   virt_readdir()
@@ -395,9 +370,27 @@ filesystem:
   real_read()
   real_release()
 
+=head1 BACKENDS
+
+As of version 0.12, TagLayer ships with two backends, PurePerl and SQLite. Both
+backends solve the info retrieval tasks required to expose the tag hierarchy in
+their own way. SQLite relies on AND-concatenated REGEX queries. The PurePerl
+implementation uses a Hash of Arrays as inverted index and does a number of boolean
+intersect operations, supported by pre-compiled sub-tag indices. Both apporaches
+are far from optimal. As a result, the Backend API is just as much in flux as the
+underlying storage structures. Currently, backends expose these functions internally:
+
+  db_init
+  db_sync
+  db_disconnect
+  db_tags_add
+  db_tags_all
+  db_files_add
+  db_files_for_tags
+
 =head1 EXPORT
 
-None by default.
+Fuse::TagLayer exports nothing.
 
 =head1 CAVEATS or TODO
 
@@ -433,6 +426,11 @@ Via xattr, it is possible to tag a directory. This is ignored for now, as we reg
 dirs within the tag-path to be "virtual" and only files in there as being "real". Makes
 things easier and is probably in-line with the idea behind a tag-based fs, putting away
 with directories.
+
+=head1 KNOWN ISSUES
+
+The newer PurePerl backend has issues with non-ascii directory names and relies on
+sub-optimal regex matching.
 
 =head1 SEE ALSO
 

@@ -12,7 +12,9 @@ my %options = (
 	'mountpoint'		=> '',
 	'no_tags_from_path'	=> 0,
 	'no_tags_from_xattr'	=> 0,
+	'ignore_numbers_only'	=> 0,
 	'debug'			=> 0,
+	'backend'		=> 'SQLite',
 	'help'			=> 0,
 );
 
@@ -23,7 +25,9 @@ GetOptions(
 	'no-tags-from-path'	=> \$options{'no_tags_from_path'},
 	'no-tags-from-xattr'	=> \$options{'no_tags_from_xattr'},
 	'more-tags'		=> \$options{'more_tags'},
+	'ignore-numbers-only'	=> \$options{'ignore_numbers_only'},
 	'debug|D+'		=> \$options{'debug'},
+	'backend|b:s'		=> \$options{'backend'},
 	'help'			=> \$options{'help'},
 ) or pod2usage(2);
 
@@ -54,7 +58,9 @@ my $ftl = Fuse::TagLayer->new(
 	'no_tags_from_path'	=> $options{'no_tags_from_path'},
 	'no_tags_from_xattr'	=> $options{'no_tags_from_xattr'},
 	'more_tags'		=> $options{'more_tags'},
-	debug			=> $options{'debug'} > 0 ? 1 : 0,
+	'ignore_numbers_only'	=> $options{'ignore_numbers_only'},
+	backend			=> $options{'backend'},
+	debug			=> $options{'debug'} > 0 ? $options{'debug'} : 0,
 );
 
 
@@ -91,15 +97,15 @@ taglayer - mounting script for Fuse::TagLayer
 
 =item B<--realdir, -r>
 
-Real directory hierarchy with all the files you want to mount as the TagLayer
-tag file-system. Required.
+Real directory hierarchy with all the files you want to mount, then layered
+with the virtual tag dirs. Required.
 
 You can choose if you want to supply this as an option switch or as the first
 argument.
 
 =item B<--mountpoint, -m>
 
-Location where to mount the TagLayer file-system. Defaults to <realdir>/+tags.
+Location where to mount the TagLayer tag file-system. Defaults to <realdir>/+tags.
 
 You can choose if you want to supply this as an option switch or as the second
 argument.
@@ -119,14 +125,26 @@ Ignore tags coming from the "user.tags" extended attribute.
 
 =item B<--more-tags>
 
-Take filenames (basenames) into account to gather more tags. Do so by splitting
-on spaces, underscores etc. and in addition, offer files' suffixes (commonly
-called "file-extensions") as the special tag "zsuffix<extension>".
+Take filenames (basenames) into account to gather more tags. Does so by splitting
+on spaces, underscores (nonalpha-numeric), and in addition, offers files' suffixes
+(commonly called "file-extensions") as the special tag "zsuffix<extension>". But might
+clutter your tag-space with many tags that are effectively unsplittable filenames.
+
+=item B<--ignore-numbers-only>
+
+Ignore tags/parsed-out-values that are all numbers (matching regex /^\d+$/).
+
+=item B<--backend, -b>
+
+TagLayer allows to switch the underlying storage backend. The default is a SQLite
+database in memory. If you want to use a pure Perl version instead, pass the string
+'PurePerl' via this option.
 
 =item B<--debug, -D>
 
-Switch on debugging output. Incremental. You can repeat this option up to two
-times. 1x means debug output from Fuse::TagLayer, 2x adds the debug messages
+Switch on debugging output. Incremental. You can repeat this option up to three
+times. 1x means debug output from Fuse::TagLayer, 2x means more verbose output
+from TagLayer and backends. 3x is even more verbose and adds the debug messages
 from Fuse.
 
 =item B<--help, -h>
@@ -136,7 +154,11 @@ Output this help text.
 =back
 
 Please note that this script currently blocks (will remain in the foreground) until
-the mount is unmounted with I<sudo umount mountpoint>.
+the mount is unmounted with I<sudo umount <mountpoint>>.
+
+=head1 KNOWN ISSUES
+
+Please refer to the library module L<Fuse::TagLayer> for known issues.
 
 =head1 SEE ALSO
 
